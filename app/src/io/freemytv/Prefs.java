@@ -148,6 +148,25 @@ final class Prefs {
         version++;
     }
 
+    // MARK: - Jellyfin
+
+    static String jellyfinServer() { return sp().getString("jellyfinServer", ""); }
+    static String jellyfinToken() { return sp().getString("jellyfinToken", ""); }
+    static String jellyfinUserId() { return sp().getString("jellyfinUserId", ""); }
+    static String jellyfinUsername() { return sp().getString("jellyfinUsername", ""); }
+
+    static void setJellyfin(String server, String token, String userId, String username) {
+        sp().edit().putString("jellyfinServer", server).putString("jellyfinToken", token)
+                .putString("jellyfinUserId", userId).putString("jellyfinUsername", username).apply();
+        version++;
+    }
+
+    static void clearJellyfin() {
+        sp().edit().remove("jellyfinServer").remove("jellyfinToken").remove("jellyfinUserId")
+                .remove("jellyfinUsername").apply();
+        version++;
+    }
+
     /** The home screen's soft click when moving and opening. */
     static boolean sounds() { return sp().getBoolean("sounds", true); }
     static void setSounds(boolean on) { put("sounds", on); }
