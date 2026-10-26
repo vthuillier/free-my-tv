@@ -30,6 +30,26 @@ matches the existing separation of concerns (`Recs` = TMDB specifically).
 
 ## Components
 
+### Reusing `Recs.Pick` as a plain data carrier (refinement found while planning)
+
+`HomeView`'s hero and card rendering (`currentPick()`, `makeHero()`, the click handlers) are
+written entirely against the `Recs.Pick` *struct* (plain fields: `kind`, `title`, `backdrop`,
+`meta`, `app`, `pkg`, `link`) — none of that code calls into TMDB-specific logic. `HomeApps.app
+(pkg, label, uri)` with `uri == null` simply resolves `pkg`'s own launch intent, which is exactly
+"open the Jellyfin app" when `pkg = "org.jellyfin.androidtv"`.
+
+So `Jellyfin.java` can build and return plain `Recs.Pick` instances (`kind = "jellyfin"`, `title`
+= episode/movie name, `meta` = series name for an episode or empty for a movie, `pkg =
+"org.jellyfin.androidtv"`, `app = null`, `link = null`, `backdrop` = a Jellyfin-specific cache
+key, *not* a TMDB path) without `Recs.java` or `HomeView`'s hero/click code changing at all
+beyond sourcing which manager a tab reads from. This keeps the original approach B's isolation
+(all Jellyfin auth/fetch/image logic lives only in `Jellyfin.java`) while touching far less of
+`HomeView.java` than first estimated — no new per-item type, no click-handling branches.
+
+The existing "no picks this tab" fallback (an empty `cards` list makes `currentPick()` return
+null, and `makeHero()` already falls back to a plain clock face) is reused as-is for "not
+configured", "server unreachable" and "nothing in progress" — no new placeholder UI needed.
+
 ### `Jellyfin.java` (new, `app/src/io/freemytv/`)
 
 Mirrors `Recs.java`'s shape:
@@ -37,29 +57,28 @@ Mirrors `Recs.java`'s shape:
 - `static Jellyfin get(Context c)` — singleton accessor.
 - `interface Listener { void onJellyfin(); }`, `addListener` / `removeListener`.
 - `boolean configured()` — true once `Prefs` holds a token.
-- `List<Item> now()` — current in-progress items (empty list if not configured, unreachable, or
-  nothing in progress).
+- `List<Recs.Pick> now()` — up to 3 current in-progress items, most recently watched first (empty
+  list if not configured, unreachable, or nothing in progress — the existing clock fallback
+  covers all three).
+- `List<Recs.Pick> wanted()` — same as `now()` (kept for symmetry with `Recs.wanted()`, used by
+  `updateCards()`'s prefetch loop).
 - `void refreshIfStale()` — called from `HomeView` on resume and when the Reprendre tab is
   selected (same trigger points `Recs.refreshIfStale()` already uses). Rules:
   - No-op if not `configured()`.
   - No-op if a fetch already in flight.
   - No-op if the last attempt failed less than 2 minutes ago (mirrors `Recs`'s 10-minute backoff,
     shortened because a local-network blip is more likely to be transient here).
-  - Otherwise fetch the list in the background (existing `io` executor pattern from `Recs`).
-- `String error()` — last failure, for the "Jellyfin indisponible" placeholder; null when fine.
-- `void connect(Context c, String server, String username, String password, Callback cb)` —
-  does the login call (below) off the main thread, invokes `cb` with success/failure; never
-  stores the password.
+  - Otherwise fetch the list in the background (same single-thread executor pattern as `Recs`).
+  - A 401 on the resume-list call clears the stored token (see Data flow) instead of retrying.
+- `Backdrop backdrop(Recs.Pick p)` — same contract as `Recs.backdrop`: returns the ready image or
+  null while it loads in the background (own in-memory cache, own disk cache directory
+  `getCacheDir()/jellyfin/`, own `Backdrop.make(bitmap, forLight)` call — the same primitive
+  `Recs` uses, not shared state).
+- `void connect(Context c, String server, String username, String password, Connect cb)` —
+  does the login call (below) off the main thread, invokes `cb` on the main thread with
+  success/failure; never stores the password.
 - `void disconnect(Context c)` — calls `/Sessions/Logout` best-effort, then clears the four
   `Prefs` fields regardless of whether the network call succeeds.
-- `static class Item { String id; String title; String subtitle; String imagePath; }` — title is
-  the episode/movie name, subtitle is the series name (empty for movies), `imagePath` is the
-  cached file once downloaded (same cache-dir-per-feature pattern as `Recs.imageFile`, under
-  `getCacheDir()/jellyfin/`).
-- Click handling: `Jellyfin.launch(Context c)` resolves and starts `org.jellyfin.androidtv`'s
-  launch intent (`PackageManager.getLaunchIntentForPackage`); if the package isn't installed,
-  `HomeView` shows the existing toast pattern used elsewhere for a missing app, same as a picks
-  card whose app was uninstalled.
 
 ### `Prefs.java` additions
 
@@ -91,20 +110,23 @@ visibility (see below).
 
 ### `HomeView.java` changes
 
-- `TAB_KIND` becomes `{null, "movie", "tv", "jellyfin"}`, **but the 4th tab is only added to the
-  tab strip when `Jellyfin.get(c).configured()` is true** — unconfigured means 3 tabs exactly as
-  today, no dimmed/unavailable 4th tab.
-- Tab selection and `updateCards()`/`updatePicks()` branch: when the selected tab is `"jellyfin"`,
-  source cards from `Jellyfin.get(c).now()` instead of `recs.now(kind)`. The hero card and the
-  row of cards reuse their existing drawing code; the per-item fields consumed are narrowed to
-  title/subtitle/image (no genre badge, no streaming-service logo, no franchise grouping — those
-  concepts don't apply to Jellyfin items).
-- Click on a Jellyfin card/hero calls `Jellyfin.launch(context)` instead of
-  `HomeApps.app(p.pkg, ...)`.
-- Empty/placeholder state: if the tab is selected and `Jellyfin.get(c).now()` is empty because of
-  `error() != null`, the hero area shows a plain "Jellyfin indisponible" message (reusing
-  whatever existing empty/error-card drawing exists for picks with no results) instead of an
-  empty carousel.
+- `TAB_KIND` becomes `{null, "movie", "tv", "jellyfin"}` — **always 4 tabs**, not conditional on
+  being configured (see "Always visible" revision below): revised from the original "4th tab
+  only when configured" after finding the tab count is a hardcoded literal `3` in roughly twenty
+  places in this file (tab-bar layout, focus/navigation, accessibility). A fixed `TAB_COUNT = 4`
+  constant replacing every one of those literals is a small, mechanical, low-risk change; making
+  the count dynamic (3 or 4) is not. Not configured → the tab shows, selecting it yields an empty
+  `cards` list, which already falls back to the plain clock face (see below) — equivalent to
+  "unavailable" without any new conditional-visibility code path.
+- `picksOn()` (currently `Recs.hasKey(getContext())`, gates whether the tab strip/hero area show
+  at all instead of a bare clock) becomes `Recs.hasKey(c) || Jellyfin.get(c).configured()`, so a
+  Jellyfin-only setup (no TMDB key) still gets the tab strip.
+- `updateCards()` branches: when `tab == JELLYFIN_TAB` (new constant, `3`), source `cards` from
+  `Jellyfin.get(c).now()`/`.wanted()`/`.backdrop(p)` instead of `recs.now(kind)`/`.wanted()`/
+  `.backdrop(p)`. Because both return `List<Recs.Pick>`, `currentPick()`, `makeHero()` and the
+  hero/card click handlers (`HomeApps.app(p.pkg, Recs.serviceName(p), p.link)`) need no changes:
+  a Jellyfin pick's `pkg = "org.jellyfin.androidtv"`, `app = null` (so `serviceName` returns `""`)
+  and `link = null` already make that call open the Jellyfin app, nothing more.
 - `HomeView` adds itself as a `Jellyfin.Listener` the same way it's a `Recs.Listener`, to redraw
   when a background fetch completes.
 
@@ -140,10 +162,10 @@ visibility (see below).
 
 | Situation | Behavior |
 |---|---|
-| Not configured | 4th tab doesn't exist. Settings row shows the login form. |
-| Configured, server unreachable (timeout/DNS/connection refused) | Tab stays visible; hero area shows "Jellyfin indisponible"; `error()` set; next attempt no sooner than 2 min later. |
-| Configured, server reachable, resume list empty | Tab stays visible; hero area shows a plain "Rien en cours" message (same placeholder mechanism as the "Jellyfin indisponible" case, different text). |
-| Token rejected (401) | Treated as session expired: `Prefs` jellyfin fields cleared, tab disappears, Settings row reverts to login form. No retry with the same token. |
+| Not configured | Tab exists, selecting it shows the plain clock face (empty `cards`, same fallback as a TMDB tab with zero picks). Settings row shows the login form. |
+| Configured, server unreachable (timeout/DNS/connection refused) | Tab stays visible; `now()` returns empty (clock face shown); `error()` set; next attempt no sooner than 2 min later. |
+| Configured, server reachable, resume list empty | Tab stays visible; clock face shown (nothing to tell apart from "unreachable" visually — both are "nothing to show right now"; `error()` still distinguishes them for a future diagnostic, not surfaced in this version). |
+| Token rejected (401) | Treated as session expired: `Prefs` jellyfin fields cleared, tab reverts to its not-configured (clock face) state, Settings row reverts to login form. No retry with the same token. |
 | Login submitted with wrong credentials | Inline error in the Settings form; nothing saved. |
 | Login submitted, server URL unreachable | Inline error distinguishing "serveur injoignable" from "identifiants invalides" (network exception vs HTTP 401 on the auth call). |
 | Jellyfin app not installed, user taps a card | Same toast/behavior already used elsewhere in the project for a picks card whose app isn't on the TV. |
