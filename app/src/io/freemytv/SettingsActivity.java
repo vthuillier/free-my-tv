@@ -25,7 +25,9 @@ import android.view.KeyEvent;
 import android.view.View;
 import android.view.accessibility.AccessibilityNodeProvider;
 import android.view.inputmethod.EditorInfo;
+import android.text.InputType;
 import android.widget.EditText;
+import android.widget.LinearLayout;
 import android.widget.Toast;
 
 import org.json.JSONArray;
@@ -733,7 +735,13 @@ public class SettingsActivity extends Activity {
             l.add("Ethereum");
             l.add("Solana");
             if (dollar()) l.add(Ui.tr("Dollar"));
+            l.add(Ui.tr("Jellyfin"));
             return l.toArray(new String[0]);
+        }
+
+        /** The Jellyfin row is always last, after the (variable-length) coin rows. */
+        private int jellyfinRow() {
+            return settingLabels().length - 1;
         }
 
         private String[] settingValues() {
@@ -756,7 +764,9 @@ public class SettingsActivity extends Activity {
             v[PLAYING_ROW] = onOff(Prefs.nowPlaying());
             v[QUOTES_ROW] = onOff(Prefs.quotes());
             // No quotes widget, nowhere to show prices: the coins read as off (and stay locked) until it is back on.
-            for (int i = COIN_ROWS; i < v.length; i++) v[i] = onOff(Prefs.quotes() && Prefs.coin(i - COIN_ROWS));
+            for (int i = COIN_ROWS; i < jellyfinRow(); i++) v[i] = onOff(Prefs.quotes() && Prefs.coin(i - COIN_ROWS));
+            v[jellyfinRow()] = Jellyfin.get(getContext()).configured()
+                    ? Ui.trf("Connected ({username})", "username", Prefs.jellyfinUsername()) : Ui.tr("Off");
             return v;
         }
 
@@ -802,7 +812,7 @@ public class SettingsActivity extends Activity {
                 whyScroll = pickScroll;
                 for (int r = 0; r < n; r++) {
                     String need = need(r);
-                    whyRows[r] = screen == HOME_SETTINGS && pickScroll + r >= COIN_ROWS && !Prefs.quotes()
+                    whyRows[r] = screen == HOME_SETTINGS && pickScroll + r >= COIN_ROWS && pickScroll + r < jellyfinRow() && !Prefs.quotes()
                             ? Ui.tr("Turn on the Quotes widget to pick its coins.")
                             : need == null ? null : Capabilities.missing(getContext(), need);
                 }
@@ -1004,6 +1014,7 @@ public class SettingsActivity extends Activity {
                 return;
             }
             int row = pickScroll + focus;
+            if (screen == HOME_SETTINGS && row == jellyfinRow()) return;   // OK opens the login/logout dialog
             switch (row) {
                 case 0: break;   // OK opens the language picker.
                 case 1: {
@@ -1059,6 +1070,57 @@ public class SettingsActivity extends Activity {
                 return true;
             });
             dialog.show();
+        }
+
+        private void askJellyfin() {
+            if (Jellyfin.get(getContext()).configured()) {
+                askJellyfinLogout();
+                return;
+            }
+            LinearLayout layout = new LinearLayout(activity);
+            layout.setOrientation(LinearLayout.VERTICAL);
+            EditText server = new EditText(activity);
+            server.setHint(Ui.tr("Server address"));
+            server.setSingleLine(true);
+            EditText username = new EditText(activity);
+            username.setHint(Ui.tr("Username"));
+            username.setSingleLine(true);
+            EditText password = new EditText(activity);
+            password.setHint(Ui.tr("Password"));
+            password.setSingleLine(true);
+            password.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+            for (EditText field : new EditText[] {server, username, password}) layout.addView(field);
+            AlertDialog dialog = new AlertDialog.Builder(activity, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                    .setTitle("Jellyfin")
+                    .setView(layout)
+                    .setPositiveButton(Ui.tr("Log in"), (d, which) -> doJellyfinLogin(
+                            server.getText().toString(), username.getText().toString(), password.getText().toString()))
+                    .setNegativeButton(Ui.tr("Cancel"), null)
+                    .create();
+            dialog.show();
+        }
+
+        private void doJellyfinLogin(String server, String username, String password) {
+            if (server.trim().isEmpty() || username.trim().isEmpty()) return;
+            Jellyfin.get(getContext()).connect(getContext(), server, username, password, (ok, error) -> {
+                if (!ok) {
+                    Toast.makeText(getContext(), error, Toast.LENGTH_LONG).show();
+                    return;
+                }
+                invalidate();
+            });
+        }
+
+        private void askJellyfinLogout() {
+            AlertDialog dialog = new AlertDialog.Builder(activity, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                    .setTitle("Jellyfin")
+                    .setMessage(Ui.trf("Disconnect from {server}?", "server", Prefs.jellyfinServer()))
+                    .setPositiveButton(Ui.tr("Disconnect"), (d, which) -> {
+                        Jellyfin.get(getContext()).disconnect(getContext());
+                        invalidate();
+                    })
+                    .setNegativeButton(Ui.tr("Cancel"), null)
+                    .show();
         }
 
         // MARK: - My Photos (sent from a computer: tools/photos.py)
@@ -1366,6 +1428,9 @@ public class SettingsActivity extends Activity {
                 return;
             } else if (screen == HOME_SETTINGS && pickScroll + focus == PHOTOS_ROW) {
                 askRemovePhotos();
+                return;
+            } else if (screen == HOME_SETTINGS && pickScroll + focus == jellyfinRow()) {
+                askJellyfin();
                 return;
             } else if (screen == POWER) {
                 activatePower();
