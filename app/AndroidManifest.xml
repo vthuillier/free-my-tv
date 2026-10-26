@@ -59,6 +59,7 @@
         <package android:name="com.htc.htcsettings" />
         <package android:name="com.softwinner.miracastReceiver" />
         <package android:name="com.softwinner.awlivetv" />
+        <package android:name="org.jellyfin.androidtv" />
         <package android:name="com.xiaomi.mitv.tvplayer" />
         <package android:name="com.amazon.tv.livetv" />
         <package android:name="com.amazon.tv.inputpreference.service" />
