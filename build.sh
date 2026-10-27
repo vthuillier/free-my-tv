@@ -6,7 +6,11 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 GENERIC=false
-for arg in "$@"; do [ "$arg" = "--generic" ] && GENERIC=true; done
+NO_DEPLOY=false
+for arg in "$@"; do
+  [ "$arg" = "--generic" ] && GENERIC=true
+  [ "$arg" = "--no-deploy" ] && NO_DEPLOY=true
+done
 
 # --- Tools
 SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
@@ -66,6 +70,9 @@ final class Config {
 
     static final String TMDB_KEY = "$(prop tmdb_key '')";
     static final String WATCHMODE_KEY = "$(prop watchmode_key '')";
+    static final String JELLYFIN_SERVER = "$(prop jellyfin_server '')";
+    static final String JELLYFIN_USERNAME = "$(prop jellyfin_username '')";
+    static final String JELLYFIN_PASSWORD = "$(prop jellyfin_password '')";
     static final String TMDB_REGION = "$REGION";
     static final String LATITUDE = "$LAT";
     static final String LONGITUDE = "$LON";
@@ -152,3 +159,17 @@ else
   "$BT/apksigner$BAT" sign --ks freemytv.keystore --ks-pass pass:freemytv --key-pass pass:freemytv --out FreeMyTV.apk out/aligned.apk
 fi
 echo "Built FreeMyTV.apk ($(du -h FreeMyTV.apk | cut -f1)). Install: adb install -r FreeMyTV.apk"
+
+if ! $GENERIC && ! $NO_DEPLOY; then
+  DEPLOY_IP="$(prop deploy_ip '')"
+  if [ -n "$DEPLOY_IP" ]; then
+    command -v adb >/dev/null 2>&1 || { echo "deploy_ip is set but adb was not found in PATH." >&2; exit 1; }
+    case "$DEPLOY_IP" in
+      *[!A-Za-z0-9._:-]*) echo "config.properties: deploy_ip contains invalid characters." >&2; exit 1 ;;
+    esac
+    echo "Deploying to $DEPLOY_IP:5555..."
+    adb connect "$DEPLOY_IP:5555" || { echo "Could not connect to $DEPLOY_IP:5555." >&2; exit 1; }
+    adb install -r FreeMyTV.apk || { echo "Could not install FreeMyTV.apk on $DEPLOY_IP:5555." >&2; exit 1; }
+    echo "Deployed FreeMyTV.apk to $DEPLOY_IP:5555"
+  fi
+fi

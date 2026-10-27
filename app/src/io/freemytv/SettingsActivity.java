@@ -1091,7 +1091,7 @@ public class SettingsActivity extends Activity {
             password.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
             for (EditText field : new EditText[] {server, username, password}) layout.addView(field);
             AlertDialog dialog = new AlertDialog.Builder(activity, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                    .setTitle("Jellyfin")
+                    .setTitle(Ui.tr("Jellyfin"))
                     .setView(layout)
                     .setPositiveButton(Ui.tr("Log in"), (d, which) -> doJellyfinLogin(
                             server.getText().toString(), username.getText().toString(), password.getText().toString()))
@@ -1113,7 +1113,7 @@ public class SettingsActivity extends Activity {
 
         private void askJellyfinLogout() {
             AlertDialog dialog = new AlertDialog.Builder(activity, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                    .setTitle("Jellyfin")
+                    .setTitle(Ui.tr("Jellyfin"))
                     .setMessage(Ui.trf("Disconnect from {server}?", "server", Prefs.jellyfinServer()))
                     .setPositiveButton(Ui.tr("Disconnect"), (d, which) -> {
                         Jellyfin.get(getContext()).disconnect(getContext());

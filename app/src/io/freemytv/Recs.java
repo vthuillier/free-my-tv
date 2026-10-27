@@ -48,6 +48,8 @@ final class Recs {
         String title, backdrop, meta = "", app, pkg;
         String link;            // opens the title in its app (looked up with Watchmode), or null: the app's home
         boolean detailed;
+        float progress;        // 0..1, for a resumable Jellyfin item
+        long jellyfinRuntimeTicks, jellyfinPositionTicks;
         java.io.File photo;     // one of your own photos (Photos): no title, no caption
     }
 

@@ -37,6 +37,8 @@ final class Jellyfin {
     interface Connect { void onResult(boolean ok, String error); }
 
     private static final long RETRY_AFTER = 2 * 60_000L;
+    private static final long LIST_EVERY = 5 * 60_000L, PROGRESS_EVERY = 30_000L, FORCE_MIN = 30_000L;
+    private static final long CACHE_MAX_AGE = 30 * 24 * 60 * 60_000L, CACHE_MAX_BYTES = 30L * 1024 * 1024;
     private static final String CLIENT = "Free My TV", DEVICE = "Android TV", VERSION = "1.0";
 
     private static Jellyfin instance;
@@ -54,7 +56,11 @@ final class Jellyfin {
     private final java.util.Set<String> pending = new java.util.HashSet<>();
     private volatile List<Recs.Pick> picks = new ArrayList<>();
     private volatile boolean fetching;
+    private volatile boolean autoConnecting;
+    private volatile long autoFailedAt;
+    private volatile boolean light;
     private volatile long failedAt;
+    private volatile long listAt, progressAt, forcedAt;
     private volatile String error = "";
 
     private Jellyfin(Context c) {
@@ -74,18 +80,69 @@ final class Jellyfin {
 
     List<Recs.Pick> wanted() { return picks; }
 
-    void refreshIfStale() {
-        if (!configured() || fetching) return;
+    boolean fetching() { return fetching || autoConnecting; }
+
+    String status() {
+        if (fetching()) return Ui.tr("Loading Jellyfin…");
+        if (!error.isEmpty()) return error;
+        return picks.isEmpty() ? Ui.tr("Nothing to resume.") : "";
+    }
+
+    void refreshNow() {
         long now = System.currentTimeMillis();
+        if (now - forcedAt < FORCE_MIN) return;
+        forcedAt = now;
+        failedAt = 0;
+        refreshIfStale();
+    }
+
+    void setLight(boolean value) {
+        if (value == light) return;
+        light = value;
+        synchronized (images) {
+            images.clear();
+        }
+    }
+
+    void refreshIfStale() {
+        if (!configured()) {
+            autoConnectFromBuild();
+            return;
+        }
+        if (fetching) return;
+        long now = System.currentTimeMillis();
+        if (listAt != 0 && now - listAt < LIST_EVERY) {
+            if (now - progressAt < PROGRESS_EVERY) return;
+            fetching = true;
+            io.execute(() -> {
+                try {
+                    refreshProgress();
+                    progressAt = System.currentTimeMillis();
+                    error = "";
+                    notifyListeners();
+                } catch (ExpiredSession e) {
+                    Prefs.clearJellyfin();
+                    error = "";
+                    notifyListeners();
+                } catch (IOException | JSONException e) {
+                    AppLog.w("jellyfin progress: " + e.getMessage());
+                } finally {
+                    fetching = false;
+                }
+            });
+            return;
+        }
         long sinceFail = now - failedAt;
         if (failedAt != 0 && sinceFail >= 0 && sinceFail < RETRY_AFTER) return;
         fetching = true;
+        notifyListeners();
         io.execute(() -> {
             try {
                 List<Recs.Pick> fetched = fetchResume();
                 picks = fetched;
                 error = "";
                 failedAt = 0;
+                listAt = progressAt = System.currentTimeMillis();
                 notifyListeners();
             } catch (ExpiredSession e) {
                 AppLog.w("jellyfin: session expired, forgetting it");
@@ -95,11 +152,31 @@ final class Jellyfin {
                 failedAt = 0;
                 notifyListeners();
             } catch (IOException | JSONException e) {
-                error = e.getMessage();
+                error = Ui.tr("Jellyfin is unreachable.");
                 failedAt = System.currentTimeMillis();
                 AppLog.w("jellyfin resume list: " + e.getMessage());
             } finally {
                 fetching = false;
+            }
+        });
+    }
+
+    private void autoConnectFromBuild() {
+        String server = Config.JELLYFIN_SERVER.trim();
+        String username = Config.JELLYFIN_USERNAME.trim();
+        String password = Config.JELLYFIN_PASSWORD;
+        if (server.isEmpty() || username.isEmpty() || password.isEmpty() || autoConnecting) return;
+        long sinceFailure = System.currentTimeMillis() - autoFailedAt;
+        if (autoFailedAt != 0 && sinceFailure >= 0 && sinceFailure < RETRY_AFTER) return;
+        autoConnecting = true;
+        connect(context, server, username, password, (ok, error) -> {
+            autoConnecting = false;
+            if (!ok) {
+                autoFailedAt = System.currentTimeMillis();
+                AppLog.w("jellyfin build config: " + error);
+                notifyListeners();
+            } else {
+                autoFailedAt = 0;
             }
         });
     }
@@ -136,6 +213,56 @@ final class Jellyfin {
         }
     }
 
+    private void refreshProgress() throws IOException, JSONException {
+        if (picks.isEmpty()) return;
+        StringBuilder ids = new StringBuilder();
+        for (Recs.Pick p : picks) {
+            if (ids.length() > 0) ids.append(',');
+            ids.append(p.link);
+        }
+        String url = Prefs.jellyfinServer() + "/Users/" + Prefs.jellyfinUserId() + "/Items?Ids=" + ids
+                + "&Fields=UserData,RunTimeTicks,ParentIndexNumber,IndexNumber,SeriesName";
+        HttpURLConnection c = open(url);
+        try {
+            int code = c.getResponseCode();
+            if (code == 401) throw new ExpiredSession();
+            if (code != 200) throw new IOException("Jellyfin returned HTTP " + code);
+            JSONArray items = new JSONObject(read(c.getInputStream())).optJSONArray("Items");
+            if (items == null) return;
+            Map<String, Recs.Pick> updated = new LinkedHashMap<>();
+            for (int i = 0; i < items.length(); i++) {
+                JSONObject item = items.getJSONObject(i);
+                Recs.Pick p = parseItem(item);
+                if (p != null) updated.put(p.link, p);
+            }
+            List<Recs.Pick> next = new ArrayList<>();
+            for (Recs.Pick old : picks) {
+                Recs.Pick p = updated.get(old.link);
+                if (p == null) {
+                    next.add(old);
+                } else {
+                    // The progress endpoint does not request image fields. Keep the
+                    // already-known image and card data while replacing playback state.
+                    p.backdrop = old.backdrop;
+                    if (p.title.isEmpty()) p.title = old.title;
+                    next.add(p);
+                }
+            }
+            picks = next;
+        } finally {
+            c.disconnect();
+        }
+    }
+
+    private HttpURLConnection open(String url) throws IOException {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setConnectTimeout(8000);
+        c.setReadTimeout(8000);
+        c.setRequestProperty("Accept", "application/json");
+        c.setRequestProperty("Authorization", authHeader(Prefs.jellyfinToken()));
+        return c;
+    }
+
     private Recs.Pick parseItem(JSONObject item) {
         String id = item.optString("Id", "");
         if (id.isEmpty()) return null;
@@ -143,10 +270,28 @@ final class Jellyfin {
         p.kind = "jellyfin";
         p.id = id.hashCode();
         p.title = item.optString("Name", "");
-        p.meta = "Episode".equals(item.optString("Type")) ? item.optString("SeriesName", "") : "";
+        List<String> details = new ArrayList<>();
+        if ("Episode".equals(item.optString("Type"))) {
+            String series = item.optString("SeriesName", "");
+            if (!series.isEmpty()) details.add(series);
+            int season = item.optInt("ParentIndexNumber", 0);
+            int episode = item.optInt("IndexNumber", 0);
+            if (season > 0 && episode > 0) {
+                details.add(Ui.trf("Season {season}, episode {episode}", "season", season, "episode", episode));
+            }
+        }
+        long runtime = item.optLong("RunTimeTicks", 0);
+        JSONObject userData = item.optJSONObject("UserData");
+        long position = userData == null ? 0 : userData.optLong("PlaybackPositionTicks", 0);
+        long remaining = runtime > position ? runtime - position : 0;
+        if (remaining > 0) details.add(duration(remaining));
+        p.meta = join(details);
+        p.progress = runtime > 0 ? Math.max(0, Math.min(1, (float) position / runtime)) : 0;
+        p.jellyfinRuntimeTicks = runtime;
+        p.jellyfinPositionTicks = position;
         p.app = null;
         p.pkg = "org.jellyfin.androidtv";
-        p.link = null;
+        p.link = id;
         p.detailed = true;
         String tag = item.optJSONArray("BackdropImageTags") != null && item.optJSONArray("BackdropImageTags").length() > 0
                 ? item.optJSONArray("BackdropImageTags").optString(0, "")
@@ -154,6 +299,22 @@ final class Jellyfin {
         boolean hasBackdrop = item.optJSONArray("BackdropImageTags") != null && item.optJSONArray("BackdropImageTags").length() > 0;
         p.backdrop = tag.isEmpty() ? null : id + ":" + (hasBackdrop ? "Backdrop" : "Primary") + ":" + tag;
         return p;
+    }
+
+    private static String duration(long ticks) {
+        long minutes = (ticks / 10_000_000L + 30) / 60;
+        if (minutes < 60) return Ui.trf("{m}m left", "m", minutes);
+        return Ui.trf("{h}h {m}m left", "h", minutes / 60, "m", minutes % 60);
+    }
+
+    private static String join(List<String> parts) {
+        StringBuilder out = new StringBuilder();
+        for (String part : parts) {
+            if (part.isEmpty()) continue;
+            if (out.length() > 0) out.append(" · ");
+            out.append(part);
+        }
+        return out.toString();
     }
 
     private static String authHeader(String token) {
@@ -254,10 +415,11 @@ final class Jellyfin {
             if (!f.exists()) download(p, f);
             Bitmap b = BitmapFactory.decodeFile(f.getPath());
             if (b == null) throw new IOException("unreadable image");
-            Backdrop backdrop = Backdrop.make(b, false);
+            boolean forLight = light;
+            Backdrop backdrop = Backdrop.make(b, forLight);
             synchronized (images) {
                 images.put(p.backdrop, backdrop);
-                while (images.size() > 4) images.remove(images.keySet().iterator().next());
+                while (images.size() > (forLight ? 10 : 4)) images.remove(images.keySet().iterator().next());
             }
             notifyListeners();
         } catch (IOException | RuntimeException | OutOfMemoryError e) {
@@ -272,11 +434,17 @@ final class Jellyfin {
         f.getParentFile().mkdirs();
         String[] parts = p.backdrop.split(":", 3);   // id:ImageType:tag
         String url = Prefs.jellyfinServer() + "/Items/" + parts[0] + "/Images/" + parts[1]
-                + "?tag=" + parts[2] + "&api_key=" + Prefs.jellyfinToken();
+                + "?tag=" + parts[2] + "&api_key=" + Prefs.jellyfinToken()
+                + "&MaxWidth=" + Backdrop.W + "&Quality=85";
         File part = new File(f.getPath() + ".part");
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
         c.setConnectTimeout(8000);
         c.setReadTimeout(20000);
+        int code = c.getResponseCode();
+        if (code != 200) {
+            c.disconnect();
+            throw new IOException("Jellyfin image returned HTTP " + code);
+        }
         try (InputStream in = c.getInputStream(); FileOutputStream out = new FileOutputStream(part)) {
             byte[] buffer = new byte[16384];
             int n;
@@ -289,6 +457,32 @@ final class Jellyfin {
             c.disconnect();
         }
         if (!part.renameTo(f)) throw new IOException("couldn't save the image");
+        pruneCache(f.getParentFile());
+    }
+
+    private void pruneCache(File dir) {
+        File[] files = dir.listFiles();
+        if (files == null) return;
+        long now = System.currentTimeMillis(), total = 0;
+        for (File f : files) {
+            if (f.getName().endsWith(".part")) continue;
+            if (now - f.lastModified() > CACHE_MAX_AGE) {
+                //noinspection ResultOfMethodCallIgnored
+                f.delete();
+            } else {
+                total += f.length();
+            }
+        }
+        if (total <= CACHE_MAX_BYTES) return;
+        java.util.Arrays.sort(files, (a, b) -> Long.compare(a.lastModified(), b.lastModified()));
+        for (File f : files) {
+            if (total <= CACHE_MAX_BYTES) break;
+            if (f.isFile() && !f.getName().endsWith(".part")) {
+                total -= f.length();
+                //noinspection ResultOfMethodCallIgnored
+                f.delete();
+            }
+        }
     }
 
     private static String read(InputStream in) throws IOException {

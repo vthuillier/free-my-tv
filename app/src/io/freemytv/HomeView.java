@@ -141,7 +141,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     private boolean nightPair;          // the glass holds both photos (day and night), blended by `night`
     private Shader nightGradient;
 
-    // At the top: tabs (0 to 2) and icon-only buttons (3 to 5); the three cards
+    // At the top: tabs (0 to 3) and icon-only buttons (4 to 6); the three cards
     private int tab, topIndex, cardIndex;
     private int widgetIndex;    // with TalkBack on, the drawer's weather (0) or quotes (1) card can take the focus
     private List<Recs.Pick> cards = new ArrayList<>();
@@ -417,6 +417,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         }
         setLightButtons(HomeApps.topButtons());
         recs.setLight(true);
+        jellyfin.setLight(true);
         checkNight(false);
         sheetLayer.setVisibility(INVISIBLE);
         scene.setMotion(0.6f, 0f);
@@ -451,7 +452,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         jellyfin.addListener(this);
         data.refreshIfStale();
         recs.refreshIfStale();
-        jellyfin.refreshIfStale();
+        jellyfin.refreshNow();
         Photos.importInbox(getContext(), ownReady);   // photos a computer just sent
         if (tvInputs != null) tvInputs.registerCallback(inputCallback, handler);
         handler.postDelayed(tick, 15_000);
@@ -867,6 +868,17 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         Hero h = new Hero();
         Recs.Pick p = currentPick();
         if (p == null) {
+            if (tab == TAB_COUNT - 1) {
+                String status = jellyfin.status();
+                if (!status.isEmpty()) {
+                    h.title = status;
+                    h.meta = "";
+                    h.titleLayout = StaticLayout.Builder.obtain(h.title, 0, h.title.length(), titlePaint,
+                            Math.max(1, Math.round(HERO_TITLE_W * k))).setMaxLines(2)
+                            .setEllipsize(TextUtils.TruncateAt.END).setIncludePad(false).build();
+                    return h;
+                }
+            }
             h.clock = true;
             h.label = Ui.date(System.currentTimeMillis()).toUpperCase(Ui.locale());
             return h;
@@ -898,7 +910,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         pickIndex = next;
         heroSlide = dir;
         refreshHero(true);
-        Backdrop b = recs.backdrop(currentPick());
+        Backdrop b = backdrop(currentPick());
         if (b != null) showBackdrop(b);
         spoken.focusMoved();
         return true;
@@ -920,6 +932,10 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         } else {
             scene.setGlassImages(glassOf(bgFrom), glassOf(b));
         }
+    }
+
+    private Backdrop backdrop(Recs.Pick p) {
+        return p != null && "jellyfin".equals(p.kind) ? jellyfin.backdrop(p) : recs.backdrop(p);
     }
 
     /** What the glass shows: the photo lightened (by day), darkened (at night) or blended in between. */
@@ -2955,7 +2971,6 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             }
         }
         for (Recs.Pick p : recs.wanted()) recs.backdrop(p);   // all three TMDB tabs preloaded: switching tabs is instant
-        for (Recs.Pick p : jellyfin.wanted()) jellyfin.backdrop(p);
         // Picks bring their own background; without them (no TMDB key and no Jellyfin), your photo if there is one.
         boolean own = !picksOn() && Photos.on(getContext());
         Backdrop b = own ? Photos.backdrop(getContext(), ownReady)
@@ -2973,6 +2988,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     private void selectTab(int index) {
         if (index == tab) return;
         tab = index;
+        if (tab == TAB_COUNT - 1) jellyfin.refreshNow();
         updateCards();
         heroDirty = true;
     }
@@ -3101,7 +3117,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         shadowDeep.setColor(Ui.alpha(0xFF000000, tone(0.14f, 0.32f) + tone(0.2f, 0.28f) * f));
         shadows.draw(c, tmp, r0, DEEP_BLUR * k, shadowDeep);
         c.restore();
-        Backdrop b = p == null ? null : recs.backdrop(p);
+        Backdrop b = p == null || ("jellyfin".equals(p.kind) && i != 0 && f <= 0.02f) ? null : backdrop(p);
         Bitmap img = b == null ? null : (i == 0 ? b.wide : b.tall);
         if (img != null) {
             roundImage(c, img, i == 0 ? b.wideShader : b.tallShader, cell, r);
@@ -3109,6 +3125,13 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             fill.setShader(null);
             fill.setColor(tone(0xFFDADADF, 0xFF2C2C2E));
             c.drawRoundRect(cell, r, r, fill);
+        }
+        if (p != null && p.progress > 0) {
+            fill.setShader(null);
+            fill.setColor(tone(0xFF8A8A8F, 0xFF6A6A70));
+            c.drawRect(base.left, base.bottom - 8 * k, base.right, base.bottom - 4 * k, fill);
+            fill.setColor(tone(0xFF4A90E2, 0xFF69A7F5));
+            c.drawRect(base.left, base.bottom - 8 * k, base.left + base.width() * p.progress, base.bottom - 4 * k, fill);
         }
         if (f > 0.01f) {
             if (lightSheens.length != cardRects.length) {
